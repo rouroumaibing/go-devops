@@ -1,0 +1,4 @@
+apiVersion: v2
+name: go-devops
+description: go-devops charts
+version: 1.0.0

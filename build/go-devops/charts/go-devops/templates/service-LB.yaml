@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.basic.component }}-l4-svc
+  labels:
+    app: {{ .Values.basic.component }}
+    version: v1
+spec:
+  type: LoadBalancer
+  ports:
+    - name: https
+      port: {{ .Values.service.externPort }}
+      nodePort: {{ .Values.service.nodePort }}
+      targetPort: {{ .Values.service.containerPort }}
+      protocol: TCP
+  selector:
+    app: {{ .Values.basic.component }}
+    version: v1

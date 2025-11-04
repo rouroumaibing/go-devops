@@ -1,0 +1,194 @@
+
+def helmDeploy(Map args) {
+  if (args.debug) {
+    println "Debug 应用"
+    sh "helm upgrade --dry-run --debug --install ${args.name} ${args.chartDir} -f ${args.valuePath} --set image.tag=${args.imageTag} --namespace ${args.namespace}"
+  } else {
+    println "部署应用"
+    sh "helm upgrade --install ${args.name} ${args.chartDir} -f ${args.valuePath}  --set image.tag=${args.imageTag} --namespace ${args.namespace}"
+    echo "应用 ${args.name} 部署成功. 可以使用 helm status ${args.name} 查看应用状态"
+  }
+}
+
+pipeline{
+  agent{
+    kubernetes{
+      cloud 'K8S'
+      slaveConnectTimeout 100   //代理在线的超时时间(以秒为单位)
+      namespace 'jenkins'
+      inheritFrom ''       //继承pod template的name，如果值是空则表示remove any inheritance
+      yaml '''
+apiVersion: "v1"
+kind: "Pod"
+metadata:
+  namespace: jenkins
+spec:
+  containers:
+  - name: "jnlp"
+  env:
+  - name: "JENKINS_AGENT_WORKDIR"
+    value: "/jenkins-agent"
+  image: "swr.cn-north-4.myhuaweicloud.com/testapp/inbound-agent:4.13-1-jdk11"
+  imagePullPolicy: "IfNotPresent"
+  resources:
+    limits:
+    memory: "256Mi"
+    cpu: "200m"
+    requests:
+    memory: "128Mi"
+    cpu: "100m"
+  securityContext:
+    privileged: true
+    runAsGroup: 0
+    runAsUser: 0
+  tty: true
+  
+  - name: kubectl
+  image: swr.cn-north-4.myhuaweicloud.com/testapp/kubectl:1.25.7
+  imagePullPolicy: "IfNotPresent"
+  securityContext:
+    privileged: false
+    runAsGroup: 0
+    runAsUser: 0
+  tty: true
+  
+  - name: docker
+  image: swr.cn-north-4.myhuaweicloud.com/testapp/docker:20.10.5-dind
+  imagePullPolicy: "IfNotPresent"
+  securityContext:
+    privileged: true
+    runAsGroup: 0
+    runAsUser: 0
+  tty: true
+   
+  - name: helm
+  image: swr.cn-north-4.myhuaweicloud.com/k8s-solution/helm:3.14.0
+  imagePullPolicy: "IfNotPresent"
+  securityContext:
+    privileged: true
+    runAsGroup: 0
+    runAsUser: 0
+  tty: true
+  
+  - name: golang
+  image: swr.cn-north-4.myhuaweicloud.com/k8s-solution/golang:1.21-debian-12
+  imagePullPolicy: "IfNotPresent"
+  command:
+  - sleep
+  args:
+  - 999999
+  securityContext:
+    privileged: true
+    runAsGroup: 0
+    runAsUser: 0
+  tty: true
+  
+  activeDeadlineSeconds: 240
+  hostNetwork: false
+  imagePullSecrets:
+  - name: "default-secret"
+  restartPolicy: "Never"
+'''
+      retries 2
+    }
+  }
+  
+  environment {
+    // 获取 git commit id 作为镜像标签
+    imageTag = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+    // 仓库地址
+    registryUrl = "swr.cn-north-4.myhuaweicloud.com"
+    imageEndpoint = "k8s-solution/devops-demo"
+    // 镜像
+    image = "${registryUrl}/${imageEndpoint}:${imageTag}"
+  } 
+  
+  stages {
+    
+    stage('1. 代码编译打包') {
+    steps{
+      container('golang'){
+      echo "1.代码编译打包阶段"
+      sh """
+      export GOPROXY=https://goproxy.cn
+      GOOS=linux GOARCH=amd64 go build -v -o demo-app
+      """
+      }    
+    }
+      }
+    
+    stage('2. 构建 Docker 镜像并推送到镜像仓库') {
+    steps{
+      container('docker'){
+      withCredentials([[$class: 'UsernamePasswordMultiBinding',
+              credentialsId: 'docker-auth',
+              usernameVariable: 'DOCKER_USER',
+              passwordVariable: 'DOCKER_PASSWORD']]) {
+        container('docker') {
+        
+        echo  "构建 Docker 镜像阶段"
+        sh """
+        docker login ${registryUrl} -u ${DOCKER_USER} -p ${DOCKER_PASSWORD}
+        docker build -t ${image} .
+        docker push ${image}
+        """
+        }
+        }
+      }
+    }
+      }
+   
+    stage("3. helm 部署应用"){
+    steps{
+      container('helm'){
+      withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+        container('helm') {
+        sh "mkdir -p ~/.kube && cp ${KUBECONFIG} ~/.kube/config"            
+        echo "开始 Helm 部署"
+        helmDeploy(
+          debug     : false,
+          name    : "devops-demo",
+          chartDir  : "./helm",
+          namespace   : "kube-ops",
+          valuePath   : "./helm/my-values.yaml",
+          //imageRepo   : "swr.cn-north-4.myhuaweicloud.com/k8s-solution/devops-demo",
+          imageTag  : "${imageTag}"
+          //imageTag  : "v1"            
+        )            
+        }
+      }
+      }
+    }
+    }
+    stage("4. kubectl查看应用部署状态"){
+    steps{
+      container('kubectl'){
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+        container('kubectl') {
+          sh "mkdir -p ~/.kube && cp ${KUBECONFIG} ~/.kube/config"
+          echo "查看流水线"
+          sh "kubectl get po -n devops-tools "
+          echo "查看业务部署情况"
+          sh "kubectl get po -n kube-ops"
+        }
+        }
+      }       
+    }
+    }
+    stage("快速回滚"){
+    steps{
+      container('helm'){
+      withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+        container('helm') {
+        sh "mkdir -p ~/.kube && cp ${KUBECONFIG} ~/.kube/config"
+        //input '确认是否需要回滚'
+        echo "确认是否需要回滚"
+         // sh "helm rollback devops-demo --namespace kube-ops"   
+        }
+      }
+      }       
+    }
+    } 
+  }  
+}
+

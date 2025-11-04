@@ -1,0 +1,19 @@
+FROM ubuntu:18.04 AS builder
+RUN apt-get update \
+  && apt-get install -y git ca-certificates curl \
+    && update-ca-certificates \
+      && curl -O  https://golang.google.cn/dl/go1.24.2.linux-amd64.tar.gz \
+        && tar -zxf go1.24.2.linux-amd64.tar.gz -C /usr/local \
+          && export PATH=$PATH:/usr/local/go/bin \
+            && export GO111MODULE=on \
+              && export GOPROXY=https://goproxy.cn,direct \
+                && export GONOSUMDB=* \
+                 && git clone https://xxxx \
+                  && cd xxx \
+                   && go build
+
+FROM ubuntu:18.04
+COPY --from=builder /**tar /**
+
+
+CMD [""]

@@ -1,0 +1,49 @@
+basic:
+  component: go-devops
+  replicaCount: 1
+  update_versions: 1.0.0
+
+service:
+  containerPort: 2356
+  externPort: 2356
+  nodePort: 0
+
+image:
+  imageAddr: xxx/xxx/go-devops:x.x.x
+  pullPolicy: IfNotPresent
+  imagePullSecrets: default-secret
+
+resources:
+  resources_cpu_requests: 250m
+  resources_cpu_limits: 250m
+  resources_mem_requests: 512Mi
+  resources_mem_limits: 512Mi
+
+certs:
+  cert_root: /source/certs
+
+# Because base64 encryption is required, the numbers need to be filled in as strings
+mysql:
+  drivername: mysql
+  user: mysql
+  pwd:  mysql@123
+  host:  mysql.mysql.svc.cluster.local
+  port: "3306"
+  dbname: CMDB
+  maxidle: "1000"
+  maxconn: "2000"
+
+redis:
+  address: redis-master.redis.svc.cluster.local:6379
+  pwd: admin@123
+  poolsize: "1000"
+  maxidle: "64"
+  idletimeout: "100" 
+
+log:
+  log_file: /var/log/go-devops.log
+
+wechat:
+  appid: wx1234567890
+  appsecret: wx1234567890
+  redirecturi: https://xxxx.com/api/auth/wechat/callback

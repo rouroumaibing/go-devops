@@ -1,0 +1,177 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.basic.component }}
+  labels:
+    app: {{ .Values.basic.component }}
+    version: v1
+spec:
+  replicas: {{ .Values.basic.replicaCount }}
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: {{ .Values.basic.component }}
+      version: v1
+  template:
+    metadata:
+      annotations: {}
+      labels:
+        app: {{ .Values.basic.component }}
+        version: v1
+    spec:
+      imagePullSecrets: 
+        - name: {{ .Values.image.imagePullSecrets }}
+      containers:
+        - name: container-1
+          command:
+            - /source/go-devops
+          args:
+            - --log_file=/var/log/go-devops.log
+          env:
+            - name: UPGRADE_VERSION
+              value: {{ .Values.basic.update_versions}}
+            - name: LOG_FILE
+              value: {{ .Values.log.log_file }}
+            - name: CERTS_ROOT
+              value: {{ .Values.certs.cert_root }}
+            - name: MYSQL_DRIVERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: drivername
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: user
+            - name: MYSQL_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: pwd
+            - name: MYSQL_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: host
+            - name: MYSQL_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: port
+            - name: MYSQL_DBNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: dbname
+            - name: MYSQL_MAXIDLE
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: maxidle
+            - name: MYSQL_MAXCONN
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: maxconn
+            - name: REDIS_ADDRESS
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: address
+            - name: REDIS_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: pwd
+            - name: REDIS_POOLSIZE
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: poolsize
+            - name: REDIS_MAXIDLE
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: maxidle
+            - name: REDIS_IDLETIMEOUT
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: idletimeout
+            - name: WECHAT_APPID
+              valueFrom:
+                secretKeyRef:
+                  name: oauth-secret
+                  key: wechat_appid
+            - name: WECHAT_APPSECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth-secret
+                  key: wechat_appsecret
+            - name: WECHAT_REDIRECTURI
+              valueFrom:
+                secretKeyRef:
+                  name: oauth-secret
+                  key: wechat_redirecturi
+          image: {{ .Values.image.imageAddr }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /api/version
+              port: 2356
+              scheme: HTTPS
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /api/version
+              port: 2356
+              scheme: HTTPS
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: {{ .Values.resources.resources_cpu_requests }}
+              memory: {{ .Values.resources.resources_mem_requests }}
+            limits:
+              cpu: {{ .Values.resources.resources_cpu_limits }}
+              memory: {{ .Values.resources.resources_mem_limits }}
+          ports:
+            - name: https
+              containerPort: {{ .Values.service.containerPort }}
+              protocol: TCP
+          volumeMounts:
+            - name: localtime
+              mountPath: /etc/localtime
+            - name: cert
+              mountPath: /source/certs
+      volumes:
+      - name: localtime
+        hostPath:
+          path: /etc/localtime
+      - name: cert
+        secret:
+          secretName: server-secret
+          defaultMode: 384
+          items:
+          - key: ca.crt
+            path: ca.crt
+          - key: server.crt
+            path: server.crt
+          - key: server.key
+            path: server.key
+      terminationGracePeriodSeconds: 30
+      dnsPolicy: ClusterFirst
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 25%
+      maxSurge: 25%
+  progressDeadlineSeconds: 600
