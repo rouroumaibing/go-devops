@@ -1,38 +1,23 @@
 package models
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"runtime/debug"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/astaxie/beego/orm"
 	"github.com/google/uuid"
 	"github.com/rouroumaibing/go-devops/pkg/apis/service"
-	"github.com/rouroumaibing/go-devops/pkg/utils/system"
-	"github.com/rouroumaibing/go-devops/pkg/workers/common"
 	"k8s.io/klog/v2"
-)
-
-var (
-	// leaderElectionManager 全局选主管理器实例
-	leaderElectionManager *common.LeaderElectionManager
-	// 用于初始化leaderElectionManager的互斥锁
-	leaderElectionMu sync.Mutex
-	// 心跳停止通道
-	heartbeatStopCh chan struct{}
 )
 
 func init() {
 	orm.RegisterModel(new(service.Pipeline), new(service.PipelineStage), new(service.PipelineStageGroupJobs), new(service.PipelineStageJobs))
-
-	// 初始化心跳停止通道
-	heartbeatStopCh = make(chan struct{})
 }
 
 func GetPipelineById(pipelineID string) (*service.Pipeline, error) {
@@ -287,15 +272,46 @@ func DeletePipelineById(pipelineID string) error {
 	return dao.Commit()
 }
 
+// CheckIsLeader 检查当前节点是否为主节点
+func CheckIsLeader() (bool, error) {
+	// 查询数据库中的leader_election表，获取当前集群的主节点信息
+	dao := orm.NewOrm()
+	var leaderInfo struct {
+		LeaderID string
+	}
+
+	// 这里假设只有一个集群，或者可以通过环境变量获取集群ID
+	err := dao.Raw("SELECT leader_id FROM leader_election LIMIT 1").QueryRow(&leaderInfo)
+	if err != nil {
+		if err == orm.ErrNoRows {
+			return false, nil // 没有主节点信息
+		}
+		return false, fmt.Errorf("查询主节点信息失败: %v", err)
+	}
+
+	// 获取当前节点ID，这里假设节点ID存储在环境变量中
+	currentNodeID := os.Getenv("NODE_ID")
+	if currentNodeID == "" {
+		return false, fmt.Errorf("未设置NODE_ID环境变量")
+	}
+
+	// 检查当前节点是否为主节点
+	return currentNodeID == leaderInfo.LeaderID, nil
+}
+
 func RunPipelineJob(pipelineId string) error {
-	// 调用master生成任务，存入到PipelineStageGroupJobs、PipelineStageJobs
-	if !leaderElectionManager.IsLeader() {
+	// 调用CheckIsLeader检查当前节点是否为主节点
+	isLeader, err := CheckIsLeader()
+	if err != nil {
+		return fmt.Errorf("检查主节点状态失败: %v", err)
+	}
+	if !isLeader {
 		return fmt.Errorf("当前不是主节点，无法生成任务")
 	}
 
 	// 事务处理
 	o := orm.NewOrm()
-	err := o.Begin()
+	err = o.Begin()
 	if err != nil {
 		return fmt.Errorf("开始事务失败: %v", err)
 	}
@@ -408,112 +424,4 @@ func GetPipelineJob(pipelineId string) (service.PipelineStageGroupJobs, error) {
 	pipelinejobs.PipelineStageJobs = append(pipelinejobs.PipelineStageJobs, stageJobs...)
 
 	return pipelinejobs, nil
-}
-
-// initLeaderElection 初始化领导者选举管理器
-func initLeaderElection() error {
-	leaderElectionMu.Lock()
-	defer leaderElectionMu.Unlock()
-
-	// 如果已经初始化，直接返回
-	if leaderElectionManager != nil {
-		return nil
-	}
-
-	// 获取本地IP作为节点地址
-	ip, err := system.GetLocalIP()
-	if err != nil {
-		return fmt.Errorf("获取本地IP失败: %w", err)
-	}
-
-	// 创建领导者选举配置
-	config := &common.Config{
-		NodeID:              fmt.Sprintf("master-%s", ip),
-		Address:             fmt.Sprintf("%s:8300", ip),
-		DataDir:             "./data/master/leader-election",
-		Peers:               []string{}, // 可以配置为集群中其他节点的地址
-		ClusterID:           "go-devops-master",
-		Kind:                "master",
-		ElectionTimeout:     10 * time.Second,
-		HeartbeatTimeout:    1 * time.Second,
-		ApplyTimeout:        5 * time.Second,
-		SnapshotRetainCount: 2,
-		LeaderChangerListener: func(isLeader bool) {
-			klog.Infof("节点 %s 领导者状态变更为: %v", ip, isLeader)
-		},
-	}
-
-	// 创建领导者选举管理器
-	manager, err := common.NewLeaderElectionManager(config)
-	if err != nil {
-		return fmt.Errorf("创建领导者选举管理器失败: %w", err)
-	}
-
-	leaderElectionManager = manager
-	return nil
-}
-
-// StartElection 开始领导者选举
-func StartElection() error {
-	// 确保领导者选举管理器已初始化
-	if leaderElectionManager == nil {
-		if err := initLeaderElection(); err != nil {
-			return err
-		}
-	}
-
-	// 领导者选举已经在NewLeaderElectionManager时自动启动
-	// 这里只需要检查当前节点是否为领导者
-	if leaderElectionManager.IsLeader() {
-		klog.Info("当前节点是领导者")
-	} else {
-		klog.Info("当前节点不是领导者")
-	}
-
-	return nil
-}
-
-// HeartBeat 发送心跳
-func HeartBeat() {
-	// 确保领导者选举管理器已初始化
-	if leaderElectionManager == nil {
-		if err := initLeaderElection(); err != nil {
-			klog.Errorf("初始化领导者选举失败: %v", err)
-			return
-		}
-	}
-
-	// 定期检查领导者状态，相当于心跳
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-heartbeatStopCh:
-				return
-			case <-ticker.C:
-				// 获取当前领导者信息
-				leaderInfo := leaderElectionManager.GetLeader()
-					if leaderInfo != nil {
-						klog.V(4).Infof("当前领导者: %s", leaderInfo.LeaderIP)
-					}
-			}
-		}
-	}()
-}
-
-// StopHeartBeat 停止心跳
-func StopHeartBeat() {
-	close(heartbeatStopCh)
-
-	// 优雅关闭领导者选举管理器
-	if leaderElectionManager != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := leaderElectionManager.Shutdown(ctx); err != nil {
-			klog.Errorf("关闭领导者选举管理器失败: %v", err)
-		}
-	}
 }

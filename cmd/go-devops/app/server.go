@@ -16,8 +16,6 @@ import (
 	"github.com/rouroumaibing/go-devops/pkg/utils/customstring"
 	"github.com/rouroumaibing/go-devops/pkg/utils/db"
 	"github.com/rouroumaibing/go-devops/pkg/utils/logger"
-	"github.com/rouroumaibing/go-devops/pkg/workers/master"
-	"github.com/rouroumaibing/go-devops/pkg/workers/worker"
 )
 
 const (
@@ -122,7 +120,4 @@ func RunInit() {
 	// 是否允许在 HTTP 请求时，返回原始请求体数据字节，默认为 false （GET or HEAD or 上传文件请求除外）。
 	beego.BConfig.CopyRequestBody = true
 
-	// 启动Master和Worker
-	go master.Deamon()
-	go worker.Deamon()
 }
