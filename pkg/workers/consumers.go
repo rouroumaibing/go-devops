@@ -3,19 +3,25 @@ package workers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/astaxie/beego/orm"
+	"github.com/rouroumaibing/go-devops/pkg/apis/service"
 )
 
-const DefaultTaskQueueSize = 100
-
-// TaskConsumer 任务消费者
 type TaskConsumer struct {
-	node        *DistributedNode
-	workerCount int
-	taskQueue   chan Task
-	wg          sync.WaitGroup
+	node           *DistributedNode
+	workerCount    int
+	taskQueue      chan Task
+	wg             sync.WaitGroup
+	mu             sync.Mutex
+	totalTasks     int64
+	completedTasks int64
+	failedTasks    int64
+	processingTime int64
 }
 
 type TaskResult struct {
@@ -24,82 +30,37 @@ type TaskResult struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
-// NewTaskConsumer 创建任务消费者，使用默认worker数量
 func NewTaskConsumer(node *DistributedNode) *TaskConsumer {
-	return NewTaskConsumerWithWorkerCount(node, DefaultWorkerCount)
-}
-
-// NewTaskConsumerWithWorkerCount 创建指定worker数量的任务消费者
-func NewTaskConsumerWithWorkerCount(node *DistributedNode, workerCount int) *TaskConsumer {
-	// 如果workerCount为0，使用默认值
-	if workerCount <= 0 {
-		workerCount = DefaultConcurrentWorkers
-	}
 	return &TaskConsumer{
 		node:        node,
-		workerCount: workerCount,
+		workerCount: DefaultConcurrentWorkers,
 		taskQueue:   make(chan Task, DefaultTaskQueueSize),
+		mu:          sync.Mutex{},
 	}
 }
 
-// NewTaskConsumerWithQueueSize 创建指定worker数量和队列大小的任务消费者
-func NewTaskConsumerWithQueueSize(node *DistributedNode, workerCount int, queueSize int) *TaskConsumer {
-	if workerCount <= 0 {
-		workerCount = DefaultConcurrentWorkers
-	}
-	if queueSize <= 0 {
-		queueSize = DefaultTaskQueueSize
-	}
-	return &TaskConsumer{
-		node:        node,
-		workerCount: workerCount,
-		taskQueue:   make(chan Task, queueSize),
-	}
-}
-
-// NewTaskConsumerWithOptions 创建支持ControllerOption配置的任务消费者
-func NewTaskConsumerWithOptions(node *DistributedNode, options *ControllerOption) *TaskConsumer {
-	// 使用默认值作为备选
-	workerCount := DefaultConcurrentWorkers
-	queueSize := DefaultTaskQueueSize
-
-	// 如果提供了选项，则使用选项中的值
-	if options != nil {
-		if options.ConcurrentWorkers > 0 {
-			workerCount = options.ConcurrentWorkers
-		}
-		// 注意：ControllerOption中没有队列大小配置，仍使用默认值
-	}
-
-	return &TaskConsumer{
-		node:        node,
-		workerCount: workerCount,
-		taskQueue:   make(chan Task, queueSize),
-	}
-}
-
-// Start 启动消费者
 func (c *TaskConsumer) Start() {
 	log.Printf("Consumer starting with %d workers on node %s",
-		c.workerCount, c.node.config.NodeID)
+		c.workerCount, c.node.config.NodeIP)
 
-	// 启动worker协程
 	for i := 0; i < c.workerCount; i++ {
 		c.wg.Add(1)
 		go c.worker(i)
 	}
 
-	// 启动任务拉取循环
-	go c.fetchTasks()
+	// 启动任务拉取循环，使用WaitGroup跟踪
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.fetchTasks()
+	}()
 }
 
-// Stop 停止消费者
 func (c *TaskConsumer) Stop() {
 	close(c.taskQueue)
 	c.wg.Wait()
 }
 
-// fetchTasks 从MySQL拉取分配给本节点的任务
 func (c *TaskConsumer) fetchTasks() {
 	ticker := time.NewTicker(time.Duration(DefaultTaskPullInterval) * time.Second)
 	defer ticker.Stop()
@@ -107,80 +68,69 @@ func (c *TaskConsumer) fetchTasks() {
 	for {
 		select {
 		case <-ticker.C:
-			if err := c.pullAssignedTasks(); err != nil {
+			if err := c.pullTasksFromGlobalQueue(); err != nil {
 				log.Printf("Failed to pull assigned tasks: %v", err)
 			}
 		case <-c.node.ctx.Done():
+
 			return
 		}
 	}
 }
 
-// pullAssignedTasks 查询分配给本节点的pending任务
-func (c *TaskConsumer) pullAssignedTasks() error {
-	query := `SELECT id, task_type, payload, retry_count 
-              FROM tasks 
-              WHERE cluster_id = ? AND worker_id = ? AND status = 'pending' 
-              LIMIT 20`
-
-	rows, err := c.node.mysqlDB.Query(query, c.node.config.ClusterID, c.node.config.NodeID)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var task Task
-		if err := rows.Scan(&task.ID, &task.Type, &task.Payload, &task.Retry); err != nil {
-			log.Printf("Failed to scan task: %v", err)
-			continue
+func (c *TaskConsumer) pullTasksFromGlobalQueue() error {
+	taskQueue := GetTaskQueue()
+	select {
+	case task, ok := <-taskQueue:
+		if ok {
+			// 有任务时仍然记录日志
+			log.Printf("Pulled task %s from global queue", task.ID)
+			c.taskQueue <- task
 		}
-		c.taskQueue <- task // 放入队列
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("Error iterating tasks: %v", err)
+	default:
+		// 无任务时完全不打印日志，减少日志量
 	}
 	return nil
 }
 
-// worker 任务处理worker
 func (c *TaskConsumer) worker(id int) {
 	defer c.wg.Done()
 
 	for task := range c.taskQueue {
-		log.Printf("Worker-%d processing task %d", id, task.ID)
+		log.Printf("Worker-%d processing task %s", id, task.ID)
 
-		// 1. 处理任务 - 添加超时控制
+		startTime := time.Now()
 		result := c.processTaskWithTimeout(task)
-
-		// 2. 记录处理结果
-		c.recordResult(task, result)
-
-		// 3. 更新状态到MySQL
+		processTime := time.Since(startTime).Milliseconds()
 		c.updateTaskStatus(task, result)
+
+		c.mu.Lock()
+		c.totalTasks++
+		c.processingTime += processTime
+		if result.Success {
+			c.completedTasks++
+		} else {
+			c.failedTasks++
+		}
+		c.mu.Unlock()
 	}
 }
 
 // processTaskWithTimeout 带超时的任务处理
 func (c *TaskConsumer) processTaskWithTimeout(task Task) *TaskResult {
-	// 创建一个带超时的上下文
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(DefaultWorkerTimeout)*time.Second)
 	defer cancel()
 
-	// 创建一个通道接收处理结果
 	resultChan := make(chan *TaskResult, 1)
-
 	go func() {
 		resultChan <- c.processTask(task)
 	}()
 
-	// 等待处理结果或超时
 	select {
 	case result := <-resultChan:
 		return result
 	case <-ctx.Done():
-		// 任务处理超时
-		log.Printf("Task %d processing timed out after %d seconds", task.ID, DefaultWorkerTimeout)
+		log.Printf("Task %s processing timed out after %d seconds", task.ID, DefaultWorkerTimeout)
 		return &TaskResult{
 			Success: false,
 			Error:   "Task processing timed out",
@@ -188,104 +138,127 @@ func (c *TaskConsumer) processTaskWithTimeout(task Task) *TaskResult {
 	}
 }
 
+// updateTaskStatus 更新任务最终状态
+func (c *TaskConsumer) updateTaskStatus(task Task, result *TaskResult) {
+	status := service.PipelineJobStatusSuccess
+	if !result.Success {
+		status = service.PipelineJobStatusFailed
+	}
+
+	dao := orm.NewOrm()
+	_, err := dao.Raw(`UPDATE pipeline_stage_jobs SET status = ? WHERE id = ?`, status, task.ID).Exec()
+	if err != nil {
+		log.Printf("Failed to update status for task %s: %v", task.ID, err)
+	}
+
+	// 同步更新Raft状态
+	if c.node.IsLeader() {
+		taskState := Task{
+			Type:   task.Type,
+			Status: status,
+		}
+		data, _ := json.Marshal(taskState)
+		cmd := Command{Type: "task", Data: data}
+		cmdBytes, _ := json.Marshal(cmd)
+		c.node.raft.Apply(cmdBytes, DefaultTimeCost)
+	}
+}
+
 // processTask 实际任务处理逻辑
 func (c *TaskConsumer) processTask(task Task) *TaskResult {
 	// 根据task.Type路由到不同处理器
+	// build_job/checkpoint/deploy_env/test_job
 	switch task.Type {
-	case "email_send":
-		return c.handleEmailTask(task)
-	case "data_sync":
-		return c.handleDataSyncTask(task)
-	// ... 其他任务类型
+	case "build_job":
+		return c.build_job(task)
+	case "checkpoint":
+		return c.checkpoint(task)
+	case "deploy_env":
+		return c.deploy_env(task)
+	case "test_job":
+		return c.test_job(task)
 	default:
 		return &TaskResult{Success: false, Error: "unknown task type"}
 	}
 }
 
-// handleEmailTask 示例：处理邮件发送任务
-func (c *TaskConsumer) handleEmailTask(task Task) *TaskResult {
-	var emailData struct {
-		To      string `json:"to"`
-		Subject string `json:"subject"`
-		Body    string `json:"body"`
-	}
+func (c *TaskConsumer) build_job(task Task) *TaskResult {
+	var buildJobData service.PipelineStageJobs
 
-	if err := json.Unmarshal(task.Payload, &emailData); err != nil {
+	if err := json.Unmarshal(task.Payload, &buildJobData); err != nil {
 		return &TaskResult{Success: false, Error: err.Error()}
 	}
+	// 任务处理
+	// TODO()
+	fmt.Printf("build_job command: %v", buildJobData.Parameters)
 
-	// 模拟处理
-	time.Sleep(1 * time.Second)
-	log.Printf("Email sent to %s", emailData.To)
-
-	return &TaskResult{Success: true, Data: map[string]string{"status": "sent"}}
-}
-
-// handleDataSyncTask 示例：处理数据同步任务
-func (c *TaskConsumer) handleDataSyncTask(task Task) *TaskResult {
-	var syncData struct {
-		Source      string `json:"source"`
-		Destination string `json:"destination"`
-		DataType    string `json:"data_type"`
-		BatchSize   int    `json:"batch_size"`
-	}
-
-	if err := json.Unmarshal(task.Payload, &syncData); err != nil {
-		return &TaskResult{Success: false, Error: err.Error()}
-	}
-
-	// 模拟处理
-	time.Sleep(2 * time.Second) // 假设数据同步需要更长时间
-	log.Printf("Data sync completed from %s to %s, data type: %s, batch size: %d",
-		syncData.Source, syncData.Destination, syncData.DataType, syncData.BatchSize)
-
-	return &TaskResult{Success: true, Data: map[string]interface{}{
-		"status":       "completed",
-		"source":       syncData.Source,
-		"destination":  syncData.Destination,
-		"records_sync": syncData.BatchSize, // 模拟同步的记录数
-	}}
-}
-
-// recordResult 记录处理结果到MySQL（幂等性保障）
-func (c *TaskConsumer) recordResult(task Task, result *TaskResult) {
-	data, _ := json.Marshal(result)
-	sql := `INSERT INTO task_processed (task_id, node_id, result) VALUES (?, ?, ?)`
-	_, err := c.node.mysqlDB.Exec(sql, task.ID, c.node.config.NodeID, data)
+	// 更新数据库状态为已完成
+	dao := orm.NewOrm()
+	_, err := dao.Raw(`UPDATE pipeline_stage_jobs SET status = ? WHERE id = ?`, service.PipelineJobStatusSuccess, buildJobData.Id).Exec()
 	if err != nil {
-		log.Printf("Failed to record result: %v", err)
+		log.Printf("Failed to update status for build_job task %s: %v", buildJobData.Id, err)
 	}
+
+	return &TaskResult{Success: true, Data: map[string]string{"status": "success"}}
 }
 
-// updateTaskStatus 更新任务最终状态
-func (c *TaskConsumer) updateTaskStatus(task Task, result *TaskResult) {
-	status := "completed"
-	if !result.Success {
-		status = "failed"
-		// 失败重试逻辑
-		if task.Retry < 3 {
-			status = "pending"
-			if _, err := c.node.mysqlDB.Exec(`UPDATE tasks SET retry_count = retry_count + 1 WHERE id = ?`, task.ID); err != nil {
-				log.Printf("Failed to update retry count for task %d: %v", task.ID, err)
-			}
-		}
+func (c *TaskConsumer) checkpoint(task Task) *TaskResult {
+	var checkPointData service.PipelineStageJobs
+
+	if err := json.Unmarshal([]byte(task.Payload), &checkPointData); err != nil {
+		return &TaskResult{Success: false, Error: err.Error()}
 	}
 
-	if _, err := c.node.mysqlDB.Exec(`UPDATE tasks SET status = ? WHERE id = ?`, status, task.ID); err != nil {
-		log.Printf("Failed to update status for task %d: %v", task.ID, err)
+	// 任务处理
+	// TODO()
+	fmt.Printf("checkpoint command: %v", checkPointData.Parameters)
+
+	// 更新数据库状态为已完成
+	dao := orm.NewOrm()
+	_, err := dao.Raw(`UPDATE pipeline_stage_jobs SET status = ? WHERE id = ?`, service.PipelineJobStatusSuccess, checkPointData.Id).Exec()
+	if err != nil {
+		log.Printf("Failed to update status for checkpoint task %s: %v", checkPointData.Id, err)
 	}
 
-	// 同步更新Raft状态
-	if c.node.IsLeader() {
-		taskState := TaskState{
-			TaskID:    task.ID,
-			Status:    status,
-			WorkerID:  c.node.config.NodeID,
-			Timestamp: time.Now().Unix(),
-		}
-		data, _ := json.Marshal(taskState)
-		cmd := Command{Type: "task_update", Data: data}
-		cmdBytes, _ := json.Marshal(cmd)
-		c.node.raft.Apply(cmdBytes, DefaultTimeCost)
+	return &TaskResult{Success: true, Data: map[string]string{"status": "success"}}
+}
+
+func (c *TaskConsumer) deploy_env(task Task) *TaskResult {
+	var deployEnvData service.PipelineStageJobs
+
+	if err := json.Unmarshal([]byte(task.Payload), &deployEnvData); err != nil {
+		return &TaskResult{Success: false, Error: err.Error()}
 	}
+	// 任务处理
+	// TODO()
+	fmt.Printf("deploy_env command: %v", deployEnvData.Parameters)
+
+	// 更新数据库状态为已完成
+	dao := orm.NewOrm()
+	_, err := dao.Raw(`UPDATE pipeline_stage_jobs SET status = ? WHERE id = ?`, service.PipelineJobStatusSuccess, deployEnvData.Id).Exec()
+	if err != nil {
+		log.Printf("Failed to update status for deploy_env task %s: %v", deployEnvData.Id, err)
+	}
+
+	return &TaskResult{Success: true, Data: map[string]string{"status": "success"}}
+}
+
+func (c *TaskConsumer) test_job(task Task) *TaskResult {
+	var testJobData service.PipelineStageJobs
+
+	if err := json.Unmarshal([]byte(task.Payload), &testJobData); err != nil {
+		return &TaskResult{Success: false, Error: err.Error()}
+	}
+	// 任务处理
+	// TODO()
+	fmt.Printf("test_job command: %v", testJobData.Parameters)
+
+	// 更新数据库状态为已完成
+	dao := orm.NewOrm()
+	_, err := dao.Raw(`UPDATE pipeline_stage_jobs SET status = ? WHERE id = ?`, service.PipelineJobStatusSuccess, testJobData.Id).Exec()
+	if err != nil {
+		log.Printf("Failed to update status for test_job task %s: %v", testJobData.Id, err)
+	}
+
+	return &TaskResult{Success: true, Data: map[string]string{"status": "success"}}
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -13,7 +12,8 @@ import (
 	"github.com/astaxie/beego/orm"
 	"github.com/google/uuid"
 	"github.com/rouroumaibing/go-devops/pkg/apis/service"
-	"k8s.io/klog/v2"
+	"github.com/rouroumaibing/go-devops/pkg/utils/system"
+	"github.com/rouroumaibing/go-devops/pkg/workers"
 )
 
 func init() {
@@ -22,17 +22,6 @@ func init() {
 
 func GetPipelineById(pipelineID string) (*service.Pipeline, error) {
 	dao := orm.NewOrm()
-
-	err := dao.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("开启事务失败: %w", err)
-	}
-	// 只读无需回滚
-	defer func() {
-		if err := dao.Rollback(); err != nil {
-			klog.Errorf("事务回滚失败: %v", err)
-		}
-	}()
 
 	// 查询pipelines
 	pipeline := &service.Pipeline{Id: pipelineID}
@@ -70,11 +59,18 @@ func CreatePipeline(p *service.Pipeline, s []*service.PipelineStage) error {
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %v", err)
 	}
+
+	// 使用committed标记确保事务只回滚一次
+	committed := false
 	defer func() {
-		if r := recover(); r != nil {
-			rollbackErr := dao.Rollback()
-			if rollbackErr != nil {
-				log.Printf("事务回滚失败: %v", rollbackErr)
+		if !committed {
+			if rollbackErr := dao.Rollback(); rollbackErr != nil {
+				log.Printf("CreatePipeline: 事务回滚失败, pipelineID: %s, err: %v", pipelineID, rollbackErr)
+			}
+			// 如果是panic，重新抛出
+			if r := recover(); r != nil {
+				log.Printf("CreatePipeline: 事务回滚时捕获到panic, pipelineID: %s, panic: %v", pipelineID, r)
+				panic(fmt.Errorf("panic in CreatePipeline: %v\n%s", r, debug.Stack()))
 			}
 		}
 	}()
@@ -82,11 +78,9 @@ func CreatePipeline(p *service.Pipeline, s []*service.PipelineStage) error {
 	pipeline_sql := `INSERT INTO pipeline(id, name, pipeline_group, component_id, service_tree, created_at, updated_at) VALUES(?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
 	_, err = dao.Raw(pipeline_sql, pipelineID, p.Name, p.PipelineGroup, p.ComponentId, p.ServiceTree).Exec()
 	if err != nil {
-		if rollbackErr := dao.Rollback(); rollbackErr != nil {
-			return fmt.Errorf("创建流水线失败: %v, 回滚错误: %v", err, rollbackErr)
-		}
 		return fmt.Errorf("创建流水线失败: %v", err)
 	}
+
 	// stageGroupOrder、stageGroupName前端传入，多个stageGroupName和stageGroupID一一对应
 	stageGroupMap := make(map[string]string)
 
@@ -101,22 +95,19 @@ func CreatePipeline(p *service.Pipeline, s []*service.PipelineStage) error {
 			stageGroupMap[stage.StageGroupName] = stageGroupID
 		}
 		_, err = dao.Raw(stage_sql, stageID, stageGroupID, stage.StageGroupName, stage.StageGroupOrder, stage.StageType, stage.StageName, stage.Parallel, stage.StageOrder, stage.JobType, stage.Parameters, pipelineID).Exec()
-
 		if err != nil {
-			if rollbackErr := dao.Rollback(); rollbackErr != nil {
-				return fmt.Errorf("创建流水线任务失败: %v, 回滚错误: %v", err, rollbackErr)
-			}
 			return fmt.Errorf("创建流水线任务失败: %v", err)
 		}
 	}
 
 	if err := dao.Commit(); err != nil {
-		if rollbackErr := dao.Rollback(); rollbackErr != nil {
-			return fmt.Errorf("提交事务失败: %v, 回滚错误: %v", err, rollbackErr)
-		}
+		// 提交失败时，事务已经被关闭，不需要再回滚
+		// 设置committed为true，防止defer函数尝试回滚
+		committed = true
 		return fmt.Errorf("提交事务失败: %v", err)
 	}
 
+	committed = true
 	return nil
 }
 
@@ -152,11 +143,17 @@ func UpdatePipelineById(p *service.Pipeline, s []*service.PipelineStage) error {
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %v", err)
 	}
+
+	// 使用committed标记确保事务只回滚一次
+	committed := false
 	defer func() {
-		if r := recover(); r != nil {
-			rollbackErr := dao.Rollback()
-			if rollbackErr != nil {
-				log.Printf("事务回滚失败: %v", rollbackErr)
+		if !committed {
+			if rollbackErr := dao.Rollback(); rollbackErr != nil {
+				log.Printf("UpdatePipelineById: 事务回滚失败, pipelineID: %s, err: %v", p.Id, rollbackErr)
+			}
+			if r := recover(); r != nil {
+				log.Printf("UpdatePipelineById: 事务回滚时捕获到panic, pipelineID: %s, panic: %v", p.Id, r)
+				panic(fmt.Errorf("panic in UpdatePipelineById: %v\n%s", r, debug.Stack()))
 			}
 		}
 	}()
@@ -167,9 +164,6 @@ func UpdatePipelineById(p *service.Pipeline, s []*service.PipelineStage) error {
 
 		_, err = dao.Raw(pipeline_sql, pipeline_params...).Exec()
 		if err != nil {
-			if rollbackErr := dao.Rollback(); rollbackErr != nil {
-				return fmt.Errorf("提交事务失败: %v, 回滚错误: %v", err, rollbackErr)
-			}
 			return fmt.Errorf("更新流水线失败: %v", err)
 		}
 	}
@@ -210,9 +204,6 @@ func UpdatePipelineById(p *service.Pipeline, s []*service.PipelineStage) error {
 				stageParams = append(stageParams, p.Id, stage.Id)
 				_, err = dao.Raw(stage_sql, stageParams...).Exec()
 				if err != nil {
-					if rollbackErr := dao.Rollback(); rollbackErr != nil {
-						return fmt.Errorf("提交事务失败: %v, 回滚错误: %v", err, rollbackErr)
-					}
 					return fmt.Errorf("更新流水线阶段失败: %v", err)
 				}
 			}
@@ -221,12 +212,13 @@ func UpdatePipelineById(p *service.Pipeline, s []*service.PipelineStage) error {
 
 	// 提交事务
 	if err := dao.Commit(); err != nil {
-		if rollbackErr := dao.Rollback(); rollbackErr != nil {
-			return fmt.Errorf("提交事务失败: %v, 回滚错误: %v", err, rollbackErr)
-		}
+		// 提交失败时，事务已经被关闭，不需要再回滚
+		// 设置committed为true，防止defer函数尝试回滚
+		committed = true
 		return fmt.Errorf("事务提交失败: %v", err)
 	}
 
+	committed = true
 	return nil
 }
 
@@ -237,20 +229,32 @@ func DeletePipelineById(pipelineID string) error {
 		return fmt.Errorf("开启事务失败: %v", err)
 	}
 
+	// 使用committed标记确保事务只回滚一次
+	committed := false
 	defer func() {
-		if rollbackErr := recover(); rollbackErr != nil {
-			_ = dao.Rollback()
-			klog.Errorf("事务回滚失败: %v", rollbackErr)
-			panic(fmt.Errorf("panic in DeletePipelineById: %v\n%s", rollbackErr, debug.Stack()))
+		if !committed {
+			// 统一回滚，不关心具体原因
+			log.Printf("DeletePipelineById: 事务回滚, pipelineID: %s", pipelineID)
+			if rollbackErr := dao.Rollback(); rollbackErr != nil {
+				log.Printf("DeletePipelineById: 事务回滚失败, pipelineID: %s, err: %v", pipelineID, rollbackErr)
+				// 忽略tx closed错误，因为这通常是由于事务已经被关闭导致的
+				if !strings.Contains(rollbackErr.Error(), "tx closed") {
+					log.Printf("DeletePipelineById: 事务回滚失败(非tx closed), pipelineID: %s, err: %v", pipelineID, rollbackErr)
+				}
+			}
+
+			if r := recover(); r != nil {
+				log.Printf("DeletePipelineById: 事务回滚时捕获到panic, pipelineID: %s, panic: %v", pipelineID, r)
+				panic(fmt.Errorf("panic in DeletePipelineById: %v\n%s", r, debug.Stack()))
+			}
+		} else {
+			log.Printf("DeletePipelineById: 事务已提交, pipelineID: %s", pipelineID)
 		}
 	}()
 
 	var exists int
 	err = dao.Raw(`SELECT 1 FROM pipeline WHERE id = ? FOR UPDATE`, pipelineID).QueryRow(&exists)
 	if err != nil {
-		if rollbackErr := dao.Rollback(); rollbackErr != nil {
-			klog.Errorf("事务回滚失败: %v", rollbackErr)
-		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("流水线不存在: %w", err)
 		}
@@ -262,67 +266,49 @@ func DeletePipelineById(pipelineID string) error {
 		{`DELETE FROM pipeline WHERE id = ?`, "流水线"},
 	} {
 		if _, err = dao.Raw(sqlCommands.sql, pipelineID).Exec(); err != nil {
-			if rollbackErr := dao.Rollback(); rollbackErr != nil {
-				return fmt.Errorf("删除%s失败: %w, 回滚错误: %v", sqlCommands.name, err, rollbackErr)
-			}
 			return fmt.Errorf("删除%s失败: %w", sqlCommands.name, err)
 		}
 	}
 
-	return dao.Commit()
-}
-
-// CheckIsLeader 检查当前节点是否为主节点
-func CheckIsLeader() (bool, error) {
-	// 查询数据库中的leader_election表，获取当前集群的主节点信息
-	dao := orm.NewOrm()
-	var leaderInfo struct {
-		LeaderID string
+	if err := dao.Commit(); err != nil {
+		// 提交失败时，事务已经被关闭，不需要再回滚
+		// 设置committed为true，防止defer函数尝试回滚
+		committed = true
+		return fmt.Errorf("提交事务失败: %w", err)
 	}
 
-	// 这里假设只有一个集群，或者可以通过环境变量获取集群ID
-	err := dao.Raw("SELECT leader_id FROM leader_election LIMIT 1").QueryRow(&leaderInfo)
-	if err != nil {
-		if err == orm.ErrNoRows {
-			return false, nil // 没有主节点信息
-		}
-		return false, fmt.Errorf("查询主节点信息失败: %v", err)
-	}
-
-	// 获取当前节点ID，这里假设节点ID存储在环境变量中
-	currentNodeID := os.Getenv("NODE_ID")
-	if currentNodeID == "" {
-		return false, fmt.Errorf("未设置NODE_ID环境变量")
-	}
-
-	// 检查当前节点是否为主节点
-	return currentNodeID == leaderInfo.LeaderID, nil
+	committed = true
+	return nil
 }
 
 func RunPipelineJob(pipelineId string) error {
-	// 调用CheckIsLeader检查当前节点是否为主节点
-	isLeader, err := CheckIsLeader()
+	localNodeIP, err := system.GetLocalIP()
 	if err != nil {
-		return fmt.Errorf("检查主节点状态失败: %v", err)
+		return fmt.Errorf("获取本地IP失败: %v", err)
 	}
-	if !isLeader {
+
+	// 调用IsLeader检查当前节点是否为主节点
+	if isLeader := workers.IsLeader(localNodeIP); !isLeader {
 		return fmt.Errorf("当前不是主节点，无法生成任务")
 	}
 
 	// 事务处理
-	o := orm.NewOrm()
-	err = o.Begin()
+	dao := orm.NewOrm()
+	err = dao.Begin()
 	if err != nil {
 		return fmt.Errorf("开始事务失败: %v", err)
 	}
+
+	// 使用committed标记确保事务只回滚一次
+	committed := false
 	defer func() {
-		if err != nil {
-			if rollbackErr := o.Rollback(); rollbackErr != nil {
-				fmt.Printf("回滚事务失败: %v\n", rollbackErr)
+		if !committed {
+			if rollbackErr := dao.Rollback(); rollbackErr != nil {
+				log.Printf("RunPipelineJob: 事务回滚失败, pipelineID: %s, err: %v", pipelineId, rollbackErr)
 			}
-		} else {
-			if commitErr := o.Commit(); commitErr != nil {
-				fmt.Printf("提交事务失败: %v\n", commitErr)
+			if r := recover(); r != nil {
+				log.Printf("RunPipelineJob: 事务回滚时捕获到panic, pipelineID: %s, panic: %v", pipelineId, r)
+				panic(fmt.Errorf("panic in RunPipelineJob: %v\n%s", r, debug.Stack()))
 			}
 		}
 	}()
@@ -333,7 +319,7 @@ func RunPipelineJob(pipelineId string) error {
 	// 2.1根据StageGroupId分组，插入任务到PipelineStageGroupJobs
 	// 2.2根据StageId分组，插入任务到PipelineStageJobs
 	var pipelineStages []service.PipelineStage
-	_, err = orm.NewOrm().QueryTable(&service.PipelineStage{}).Filter("PipelineId", pipelineId).All(&pipelineStages)
+	_, err = dao.QueryTable(&service.PipelineStage{}).Filter("pipeline_id", pipelineId).All(&pipelineStages)
 	if err != nil {
 		return fmt.Errorf("查询流水线阶段失败: %w", err)
 	}
@@ -366,7 +352,7 @@ func RunPipelineJob(pipelineId string) error {
 			UpdatedAt:       time.Now(),
 		}
 
-		_, err = o.Insert(groupJob)
+		_, err = dao.Insert(groupJob)
 		if err != nil {
 			return fmt.Errorf("插入阶段组任务失败: %w", err)
 		}
@@ -391,7 +377,7 @@ func RunPipelineJob(pipelineId string) error {
 				UpdatedAt:       time.Now(),
 			}
 
-			_, err = o.Insert(stageJob)
+			_, err = dao.Insert(stageJob)
 			if err != nil {
 				return fmt.Errorf("插入阶段任务失败: %w", err)
 			}
@@ -400,28 +386,41 @@ func RunPipelineJob(pipelineId string) error {
 		}
 
 		groupJob.StageJobIds = strings.Join(stageJobIds, ",")
-		_, err = o.Update(groupJob)
+		_, err = dao.Update(groupJob)
 		if err != nil {
 			return fmt.Errorf("更新阶段组任务ID列表失败: %w", err)
 		}
 	}
+
+	// 提交事务
+	if err := dao.Commit(); err != nil {
+		// 提交失败时，事务已经被关闭，不需要再回滚
+		// 设置committed为true，防止defer函数尝试回滚
+		committed = true
+		return fmt.Errorf("提交事务失败: %w", err)
+	}
+
+	committed = true
 	return nil
 }
 
-func GetPipelineJob(pipelineId string) (service.PipelineStageGroupJobs, error) {
+func GetPipelineJob(pipelineId string) ([]service.PipelineStageGroupJobs, error) {
 	// 查询PipelineStageGroupJobs，返回切片
-	var pipelinejobs service.PipelineStageGroupJobs
-	_, err := orm.NewOrm().QueryTable(&service.PipelineStageGroupJobs{}).Filter("PipelineId", pipelineId).All(&pipelinejobs)
+	var pipelinejobs []service.PipelineStageGroupJobs
+	_, err := orm.NewOrm().QueryTable(&service.PipelineStageGroupJobs{}).Filter("pipeline_id", pipelineId).All(&pipelinejobs)
 	if err != nil {
-		return service.PipelineStageGroupJobs{}, fmt.Errorf("查询流水线阶段组任务失败: %w", err)
+		return nil, fmt.Errorf("查询流水线阶段组任务失败: %w", err)
 	}
 
-	var stageJobs []service.PipelineStageJobs
-	_, err = orm.NewOrm().QueryTable(&service.PipelineStageJobs{}).Filter("StageGroupJobId", pipelinejobs.Id).All(&stageJobs)
-	if err != nil {
-		return service.PipelineStageGroupJobs{}, fmt.Errorf("查询流水线阶段任务失败: %w", err)
+	// 为每个阶段组任务查询对应的阶段任务
+	for job := range pipelinejobs {
+		var stageJobs []service.PipelineStageJobs
+		_, err = orm.NewOrm().QueryTable(&service.PipelineStageJobs{}).Filter("stage_group_job_id", pipelinejobs[job].Id).All(&stageJobs)
+		if err != nil {
+			return nil, fmt.Errorf("查询流水线阶段任务失败: %w", err)
+		}
+		pipelinejobs[job].PipelineStageJobs = append(pipelinejobs[job].PipelineStageJobs, stageJobs...)
 	}
-	pipelinejobs.PipelineStageJobs = append(pipelinejobs.PipelineStageJobs, stageJobs...)
 
 	return pipelinejobs, nil
 }

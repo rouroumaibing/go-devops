@@ -2,7 +2,11 @@ package app
 
 import (
 	goflag "flag"
+	"fmt"
+	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	beego "github.com/astaxie/beego"
@@ -16,6 +20,8 @@ import (
 	"github.com/rouroumaibing/go-devops/pkg/utils/customstring"
 	"github.com/rouroumaibing/go-devops/pkg/utils/db"
 	"github.com/rouroumaibing/go-devops/pkg/utils/logger"
+	"github.com/rouroumaibing/go-devops/pkg/utils/system"
+	"github.com/rouroumaibing/go-devops/pkg/workers"
 )
 
 const (
@@ -26,7 +32,6 @@ func init() {
 	jwtauth.Init()
 	redisInit()
 	mysqlInit()
-	RunInit()
 }
 
 func mysqlInit() {
@@ -120,4 +125,70 @@ func RunInit() {
 	// 是否允许在 HTTP 请求时，返回原始请求体数据字节，默认为 false （GET or HEAD or 上传文件请求除外）。
 	beego.BConfig.CopyRequestBody = true
 
+	node, producer, consumer := WokersInit()
+
+	// 将defer语句放在前面，确保资源一定会被清理
+	defer klog.Flush()
+	defer db.RedisClient.Close()
+
+	// 设置信号处理
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 在goroutine中运行beego服务器，避免阻塞主协程
+	go beego.Run()
+
+	// 等待中断信号
+	<-sigChan
+	klog.Info("Received shutdown signal, starting graceful shutdown...")
+
+	if err := node.Shutdown(); err != nil {
+		klog.Errorf("node.Shutdown failed: %v", err)
+	}
+	consumer.Stop()
+	producer.Stop()
+
+	klog.Info("Graceful shutdown completed")
+	os.Exit(0)
+}
+
+func WokersInit() (node *workers.DistributedNode, producer *workers.TaskProducer, consumer *workers.TaskConsumer) {
+	raftClusterID := os.Getenv("RAFT_CLUSTER_ID")
+	clusterID := os.Getenv("CLUSTER_ID")
+	raftPort := os.Getenv("RAFT_PORT")
+	if raftPort == "" {
+		raftPort = workers.DefaultRaftPort
+	}
+
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = workers.DefaultDataDir
+	}
+
+	localIP, err := system.GetLocalIP()
+	if err != nil {
+		log.Fatalf("Failed to get local IP address: %v", err)
+	}
+	raftAddr := fmt.Sprintf("%s:%s", localIP, raftPort)
+
+	cfg := workers.NodeConfig{
+		RaftClusterID: raftClusterID,
+		NodeIP:        localIP,
+		ClusterID:     clusterID,
+		RaftAddr:      raftAddr,
+		DataDir:       dataDir,
+	}
+
+	node, err = workers.NewDistributedNode(cfg)
+	if err != nil {
+		log.Fatalf("Failed to create node: %v", err)
+	}
+
+	producer = workers.NewTaskProducer(node)
+	producer.Start()
+
+	consumer = workers.NewTaskConsumer(node)
+	consumer.Start()
+
+	return node, producer, consumer
 }

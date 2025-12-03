@@ -3,130 +3,141 @@ package workers
 import (
 	"encoding/json"
 	"log"
-	"math/rand"
 	"sync"
 	"time"
 
-	"golang.org/x/time/rate"
+	"github.com/astaxie/beego/orm"
+	"github.com/rouroumaibing/go-devops/pkg/apis/service"
 )
-
-type Task struct {
-	ID      int64           `json:"id"`
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
-	Retry   int             `json:"retry"`
-}
 
 // TaskProducer 任务生产者
 type TaskProducer struct {
-	node       *DistributedNode
-	workerPool []string
-	batchSize  int
-	mu         sync.RWMutex
-	limiter    *rate.Limiter
+	node          *DistributedNode
+	producerCount int
+	wg            sync.WaitGroup
 }
 
 func NewTaskProducer(node *DistributedNode) *TaskProducer {
 	return &TaskProducer{
-		node:       node,
-		workerPool: []string{node.config.NodeID}, // 初始只有自己
-		batchSize:  10,
-		// 使用默认的全局QPS和Burst配置初始化限流器
-		limiter: rate.NewLimiter(rate.Limit(DefaultGlobalMaxQPS), DefaultGlobalMaxBurst),
+		node:          node,
+		producerCount: DefaultProducerCount,
 	}
 }
 
-// runProducer 主生产循环
+// controller check if node is leader from db.
+func IsLeader(nodeIP string) bool {
+	dao := orm.NewOrm()
+	var count int64
+	err := dao.Raw(`SELECT COUNT(*) FROM leader_election WHERE leader_ip = ?`, nodeIP).QueryRow(&count)
+	if err != nil {
+		return false
+	}
+	return count > 0
+}
+
+func (p *TaskProducer) Start() {
+	InitTaskQueue(TaskQueueCHSize)
+	InitClusterList()
+
+	go p.RunProducer()
+
+}
+
 func (p *TaskProducer) RunProducer() {
-	log.Printf("Producer started on leader %s", p.node.config.NodeID)
+	log.Printf("Producer started on leader %s", p.node.config.NodeIP)
 
-	ticker := time.NewTicker(time.Duration(DefaultTaskProduceInterval) * time.Second)
-	defer ticker.Stop()
+	for producer := 0; producer < p.producerCount; producer++ {
+		p.wg.Add(1)
+		go func(producerID int) {
+			defer p.wg.Done()
+			log.Printf("Producer goroutine %d started on node %s", producerID, p.node.config.NodeIP)
 
-	for {
-		select {
-		case <-ticker.C:
-			if !p.node.IsLeader() {
-				log.Printf("No longer leader, stopping producer")
-				return
+			// 将ticker移到循环外部，避免每次循环都创建新的ticker
+			ticker := time.NewTicker(time.Duration(DefaultTaskProduceInterval) * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					isLeader := p.node.IsLeader()
+					if isLeader {
+						if err := p.produceTasks(); err != nil {
+							log.Printf("Failed to produce tasks: %v", err)
+						}
+					}
+				case <-p.node.ctx.Done():
+					log.Printf("Producer %d shutting down", producerID)
+					return
+				}
 			}
-			if err := p.produceTasks(); err != nil {
-				log.Printf("Failed to produce tasks: %v", err)
-			}
-		case <-p.node.ctx.Done():
-			return
-		}
+		}(producer)
 	}
 }
 
-// produceTasks 从MySQL拉取任务并分配
 func (p *TaskProducer) produceTasks() error {
-	// 应用速率限制
-	if err := p.limiter.Wait(p.node.ctx); err != nil {
-		log.Printf("Rate limiter error: %v", err)
-		return err
-	}
 
 	// 1. 查询pending状态任务
-	query := `SELECT id, task_type, payload, retry_count 
-              FROM tasks 
-              WHERE cluster_id = ? AND status = 'pending' 
-              LIMIT ?`
-
-	rows, err := p.node.mysqlDB.Query(query, p.node.config.ClusterID, p.batchSize)
+	// 从表PipelineStageJobs查询status为wait的任务所有字段
+	dao := orm.NewOrm()
+	var jobs []service.PipelineStageJobs
+	_, err := dao.Raw(`SELECT * FROM pipeline_stage_jobs WHERE status = 'wait'`).QueryRows(&jobs)
 	if err != nil {
+		log.Printf("Error querying wait tasks: %v", err)
 		return err
 	}
-	defer rows.Close()
-
-	var tasks []Task
-	for rows.Next() {
-		var task Task
-		err := rows.Scan(&task.ID, &task.Type, &task.Payload, &task.Retry)
-		if err != nil {
-			log.Printf("Failed to scan task: %v", err)
-			continue
-		}
-		tasks = append(tasks, task)
-	}
-	if err := rows.Err(); err != nil {
-		log.Printf("Error iterating tasks: %v", err)
+	if jobs == nil {
+		return nil
 	}
 
-	// 2. 分配任务给worker
-	for _, task := range tasks {
-		workerID := p.selectWorker() // 负载均衡策略
-		if err := p.assignTask(task, workerID); err != nil {
-			log.Printf("Failed to assign task %d: %v", task.ID, err)
-			continue
-		}
+	ch := GetTaskQueue()
+
+	// 2. 分配任务到全局队列
+	for _, job := range jobs {
+		log.Printf("Processing job: %s, Name: %s", job.Id, job.Name)
 
 		// 3. 更新任务状态为processing
-		p.updateTaskStatus(task.ID, "processing", workerID)
+		// 先更新状态再分配，避免重复处理
+		p.updateTaskStatus(job.Id, "processing")
+
+		// 4. 分配任务
+		if err := p.assignTask(job.Name, job.Id, "processing"); err != nil {
+			log.Printf("Failed to assign task %s: %v", job.Id, err)
+			// 即使Raft分配失败，也将任务放入队列，确保任务能够被处理
+		}
+
+		jobJSON, err := json.Marshal(job)
+		if err != nil {
+			log.Printf("Failed to marshal job %s: %v", job.Id, err)
+			continue
+		}
+
+		// 5. 将任务放入到全局队列中
+		select {
+		case ch <- Task{
+			Type:    job.Name,
+			ID:      job.Id,
+			Status:  "processing",
+			Payload: jobJSON,
+		}:
+			log.Printf("Successfully added task %s to global queue", job.Id)
+		default:
+			log.Printf("Failed to add task %s to queue: queue is full", job.Id)
+		}
 	}
 
 	return nil
 }
 
-// selectWorker 选择worker节点（简单轮询或一致性哈希）
-func (p *TaskProducer) selectWorker() string {
-	// 简单随机策略
-	// 生产环境建议使用一致性哈希：taskID -> workerID
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.workerPool[rand.Intn(len(p.workerPool))]
-}
-
-// assignTask 通过Raft提交任务分配命令
-func (p *TaskProducer) assignTask(task Task, workerID string) error {
-	assignment := TaskAssignment{
-		TaskID:   task.ID,
-		WorkerID: workerID,
+func (p *TaskProducer) assignTask(taskType string, taskID string, status string) error {
+	assignment := Task{
+		Type:   taskType,
+		ID:     taskID,
+		Status: status,
 	}
 
 	data, _ := json.Marshal(assignment)
 	cmd := Command{
-		Type: "task_assign",
+		Type: "task",
 		Data: data,
 	}
 
@@ -137,25 +148,27 @@ func (p *TaskProducer) assignTask(task Task, workerID string) error {
 	return future.Error()
 }
 
-// updateTaskStatus 更新MySQL中的任务状态
-func (p *TaskProducer) updateTaskStatus(taskID int64, status string, workerID string) {
-	sql := `UPDATE tasks SET status = ?, worker_id = ? WHERE id = ?`
-	_, err := p.node.mysqlDB.Exec(sql, status, workerID, taskID)
+// updateTaskStatus 更新数据库中的任务状态
+func (p *TaskProducer) updateTaskStatus(taskID string, status string) {
+	dao := orm.NewOrm()
+	sql := `UPDATE pipeline_stage_jobs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	result, err := dao.Raw(sql, status, taskID).Exec()
 	if err != nil {
-		log.Printf("Failed to update task status: %v", err)
+		log.Printf("Failed to update task %s status to %s: %v", taskID, status, err)
+		return
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		log.Printf("Failed to get affected rows for task %s: %v", taskID, err)
+	} else if affected == 0 {
+		log.Printf("Warning: No rows affected when updating task %s status", taskID)
+	} else {
+		log.Printf("Successfully updated task %s status to %s", taskID, status)
 	}
 }
 
-// AddWorker 动态添加worker节点
-func (p *TaskProducer) AddWorker(nodeID string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for _, id := range p.workerPool {
-		if id == nodeID {
-			return // 已存在
-		}
-	}
-	p.workerPool = append(p.workerPool, nodeID)
-	log.Printf("Worker %s added to pool", nodeID)
+func (p *TaskProducer) Stop() {
+	log.Printf("Producer stopped on leader %s", p.node.config.NodeIP)
+	p.wg.Wait()
 }

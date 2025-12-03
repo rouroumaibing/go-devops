@@ -30,6 +30,7 @@ func (m *MysqlConfig) Init() {
 	//:MaxIdle 最大空闲数
 	//:MaxConn 最大连接数
 	//dbConn := "xxx:xxxxx@tcp(127.0.0.1:3306)/dbname?charset=utf8mb4"
+	//dbConn := "xxx:xxxxx@tcp(127.0.0.1:3306)/dbname?charset=utf8mb4&time_zone=%2B08%3A00" 时区设置为上海
 	dbConn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4", m.User, m.Pwd, m.Host, m.Port, m.DBName)
 	err = orm.RegisterDataBase("default", m.DriverName, dbConn, m.MaxIdle, m.MaxConn)
 	if err != nil {
