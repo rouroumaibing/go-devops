@@ -30,6 +30,12 @@ spec:
           env:
             - name: UPGRADE_VERSION
               value: {{ .Values.basic.update_versions}}
+            - name: CLUSTER_ID
+              value: {{ .Values.basic.cluster_id }}
+            - name: RAFT_PORT
+              value: {{ .Values.basic.raft_port }}
+            - name: RAFT_CLUSTER_ID
+              value: {{ .Values.basic.raft_cluster_id }}
             - name: LOG_FILE
               value: {{ .Values.log.log_file }}
             - name: CERTS_ROOT

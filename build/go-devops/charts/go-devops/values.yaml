@@ -2,6 +2,9 @@ basic:
   component: go-devops
   replicaCount: 1
   update_versions: 1.0.0
+  cluster_id: cluster1-id
+  raft_port: "7001"
+  raft_cluster_id: raft-cluster-prod
 
 service:
   containerPort: 2356
@@ -26,7 +29,7 @@ certs:
 mysql:
   drivername: mysql
   user: mysql
-  pwd:  mysql@123
+  pwd:  "******"
   host:  mysql.mysql.svc.cluster.local
   port: "3306"
   dbname: CMDB
@@ -35,7 +38,7 @@ mysql:
 
 redis:
   address: redis-master.redis.svc.cluster.local:6379
-  pwd: admin@123
+  pwd: "******"
   poolsize: "1000"
   maxidle: "64"
   idletimeout: "100" 
